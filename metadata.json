@@ -1,0 +1,6 @@
+{
+  "name": "SR Video Quality & Stream Studio",
+  "description": "Multi-quality video streaming server, real-time Super-Resolution video enhancer, Telegram File-to-Link bot engine, and pre-configured domain deployment studio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
