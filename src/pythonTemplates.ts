@@ -9,11 +9,11 @@ export interface PythonTemplateParams {
 
 export function generateFixedPythonFiles(params: PythonTemplateParams) {
   const cleanDomain = (
-    params.domain || 'https://ais-dev-w4opwh3w5736ifna5yycat-160296201066.asia-east1.run.app'
+    params.domain || ''
   ).replace(/\/$/, '');
   const mongoUri =
     params.mongoUri ||
-    'mongodb+srv://sabbirvai1122:SABBIRVAI1122@cluster0.t1bsiei.mongodb.net/?appName=Cluster0';
+    '';
   const apiId = params.apiId || '2040';
   const apiHash = params.apiHash || 'b18441a1ff607e10a989891a5462e627';
   const botToken = params.botToken || 'YOUR_BOT_TOKEN_HERE';
