@@ -9,7 +9,7 @@ export interface PythonTemplateParams {
 
 export function generateFixedPythonFiles(params: PythonTemplateParams) {
   const cleanDomain = (
-    params.domain || ''
+    params.domain || 'https://sr-file-to-link-telegram-bot-hmib.onrender.com'
   ).replace(/\/$/, '');
   const mongoUri =
     params.mongoUri ||
