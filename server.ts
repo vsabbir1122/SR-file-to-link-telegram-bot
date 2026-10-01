@@ -2,6 +2,7 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import dns from 'dns';
 import { spawn } from 'child_process';
 import dotenv from 'dotenv';
 import { Readable } from 'stream';
@@ -11,6 +12,11 @@ import { StringSession } from 'telegram/sessions/index.js';
 import bigInt from 'big-integer';
 
 dotenv.config();
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {
+  // ignore
+}
 
 // Prevent background GramJS socket timeouts from crashing the server process
 process.on('unhandledRejection', (reason: any) => {
@@ -865,6 +871,20 @@ async function syncAndRewriteTelegramLinksToPermanentDomain() {
           createdAt: d.createdAt || new Date().toISOString(),
           qualities: buildQualityVariants(`${targetDom}/stream/${d.id}`, sizeBytes),
         });
+      } else {
+        const memV = videos.get(d.id)!;
+        if (d.botReplyMessageId && !memV.botReplyMessageId) {
+          memV.botReplyMessageId = d.botReplyMessageId;
+        }
+        if (d.binMessageId && !memV.binMessageId) {
+          memV.binMessageId = d.binMessageId;
+        }
+        if (d.title && memV.title === 'None' && d.title !== 'None') {
+          memV.title = d.title;
+        }
+        if (d.fileName && memV.fileName === 'None.mp4' && d.fileName !== 'None.mp4') {
+          memV.fileName = d.fileName;
+        }
       }
     }
     for (const memId of Array.from(videos.keys())) {
@@ -875,6 +895,60 @@ async function syncAndRewriteTelegramLinksToPermanentDomain() {
     }
     botState.mongoVideosCount = dbIds.size;
     botState.processedCount = videos.size;
+
+    // Auto-recover any recent video (within last 10 mins, >4s old) whose Telegram reply failed to send on Render/any instance
+    const nowMs = Date.now();
+    for (const d of allDbDocs.slice(0, 10)) {
+      if (
+        d.id &&
+        d.sourceType === 'telegram' &&
+        d.chatId &&
+        d.messageId &&
+        String(d.chatId) !== String(botState.binChannel) &&
+        !d.botReplyMessageId &&
+        !isVideoDeleted(d.id)
+      ) {
+        const createdMs = d.createdAt ? new Date(d.createdAt).getTime() : 0;
+        const ageMs = nowMs - createdMs;
+        if (createdMs > 0 && ageMs >= 4500 && ageMs <= 10 * 60 * 1000) {
+          // Atomically claim the missing reply so only 1 instance sends the recovery message
+          const claimRes = await videosCollection
+            .updateOne(
+              { id: d.id, $or: [{ botReplyMessageId: { $exists: false } }, { botReplyMessageId: null as any }] },
+              { $set: { botReplyMessageId: -1 } }
+            )
+            .catch(() => null);
+          if (claimRes && claimRes.modifiedCount > 0) {
+            const watchEndpoint = `${targetDom}/player/${d.id}`;
+            const dlEndpoint = `${targetDom}/dl/${d.id}`;
+            const safeHtmlFileName = String(d.title || d.fileName || d.id)
+              .replace(/\.(mp4|mkv|avi|mov|webm|flv|m4v|ts|3gp|wmv|mpg|mpeg)$/i, '')
+              .replace(/[_-]+/g, ' ')
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+            const sizeBytes = Number(d.sizeBytes) || 50 * 1024 * 1024;
+            const replyData = await tgBotPost('sendMessage', {
+              chat_id: d.chatId,
+              reply_to_message_id: Number(d.messageId),
+              text: buildBotReplyHtmlText(safeHtmlFileName, sizeBytes, watchEndpoint, dlEndpoint),
+              parse_mode: 'HTML',
+              disable_web_page_preview: true,
+              reply_markup: buildMainQualityPromptKeyboard(d.id, watchEndpoint, dlEndpoint),
+            });
+            if (replyData?.ok && replyData.result?.message_id) {
+              const sentMsgId = Number(replyData.result.message_id);
+              await videosCollection.updateOne({ id: d.id }, { $set: { botReplyMessageId: sentMsgId } }).catch(() => {});
+              const memV = videos.get(d.id);
+              if (memV) memV.botReplyMessageId = sentMsgId;
+              addLog('success', `Auto-recovered & sent missing Telegram video links for ${d.id} (msg ${sentMsgId})`);
+            } else {
+              await videosCollection.updateOne({ id: d.id }, { $set: { botReplyMessageId: null } }).catch(() => {});
+            }
+          }
+        }
+      }
+    }
 
     const recentDocs = await videosCollection
       .find({
@@ -1194,6 +1268,48 @@ async function resolveTelegramFilePath(fileId: string, token: string): Promise<s
   return null;
 }
 
+async function tgBotPost(method: string, payload: Record<string, any>, retries = 3): Promise<any> {
+  if (!botState.botToken) return { ok: false, description: 'Missing botToken' };
+  const url = `https://api.telegram.org/bot${botState.botToken}/${method}`;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      const data = (await res.json()) as any;
+      if (data?.ok) return data;
+      // If reply_to_message_id message was not found/deleted, retry immediately without reply_to_message_id
+      if (
+        payload.reply_to_message_id &&
+        String(data?.description || '').toLowerCase().includes('message to be replied not found')
+      ) {
+        const { reply_to_message_id, ...withoutReply } = payload;
+        payload = withoutReply;
+        continue;
+      }
+      if (data?.error_code === 429 && data?.parameters?.retry_after) {
+        const waitMs = Math.min(Number(data.parameters.retry_after) * 1000, 8000);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      if (attempt === retries) return data;
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (attempt === retries) {
+        return { ok: false, description: err?.message || 'Network timeout' };
+      }
+      await new Promise((r) => setTimeout(r, 800 * attempt));
+    }
+  }
+  return { ok: false };
+}
+
 async function startTelegramPolling() {
   if (!botState.botToken) return;
   const myPollingGen = ++activePollingGeneration;
@@ -1250,6 +1366,17 @@ async function startTelegramPolling() {
           const updatesUrl = `https://api.telegram.org/bot${botState.botToken}/getUpdates?offset=${lastUpdateId + 1}&timeout=20`;
           const res = await fetch(updatesUrl, { signal });
           const data = (await res.json()) as any;
+          if (!data.ok && data.error_code === 409) {
+            // Another instance (e.g. Render) is actively polling getUpdates; yield if not running on Render
+            const isRunningOnRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL);
+            if (!isRunningOnRender) {
+              pollingAbortController?.abort();
+              pollingAbortController = null;
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 5000));
+            continue;
+          }
           if (data.ok && Array.isArray(data.result) && data.result.length > 0) {
             for (const u of data.result) {
               if (typeof u?.update_id === 'number') {
@@ -1262,6 +1389,7 @@ async function startTelegramPolling() {
             ).catch(() => {});
 
             for (const update of data.result) {
+              try {
               if (typeof update?.update_id === 'number') {
                 if (processedUpdateIds.has(update.update_id)) {
                   continue;
@@ -1869,9 +1997,11 @@ async function startTelegramPolling() {
                 const primaryIdNum = binMsgId || msg.message_id || Date.now().toString().slice(-5);
                 const vidId = `tg-${primaryIdNum}`;
                 const rawMediaName = (media.file_name || '').trim();
-                const strippedMediaName = rawMediaName
+                const rawStrippedName = rawMediaName
                   .replace(/\.(mp4|mkv|avi|mov|webm|flv|m4v|ts|3gp|wmv|mpg|mpeg)$/i, '')
                   .trim();
+                const isPlaceholderName = /^(none|null|undefined|video|document|file|unknown)$/i.test(rawStrippedName);
+                const strippedMediaName = isPlaceholderName ? '' : rawStrippedName;
                 const captionFirstLine = (msg.caption || '')
                   .split('\n')
                   .map((l: string) => l.trim())
@@ -1926,6 +2056,29 @@ async function startTelegramPolling() {
                 await saveVideoToMongo(newItem);
                 botState.processedCount += 1;
 
+                // Send the Telegram reply FIRST (with 3x auto-retry & IPv4 fast path) before any background MTProto warm-up
+                if (String(chatId) !== String(botState.binChannel)) {
+                  const safeHtmlFileName = displayTitle
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+                  const replyData = await tgBotPost('sendMessage', {
+                    chat_id: chatId,
+                    reply_to_message_id: msg.message_id,
+                    text: buildBotReplyHtmlText(safeHtmlFileName, fileSize, watchEndpoint, dlEndpoint),
+                    parse_mode: 'HTML',
+                    disable_web_page_preview: true,
+                    reply_markup: buildMainQualityPromptKeyboard(vidId, watchEndpoint, dlEndpoint),
+                  });
+                  if (replyData?.ok && replyData.result?.message_id) {
+                    newItem.botReplyMessageId = replyData.result.message_id;
+                    videos.set(vidId, newItem);
+                    await saveVideoToMongo(newItem);
+                  } else {
+                    addLog('warn', `Telegram reply notice for ${vidId}: ${replyData?.description || 'Retrying'}`);
+                  }
+                }
+
                 // Pre-cache MTProto media handle, probe codec/duration, & warm up initial blocks in background for 0ms startup
                 if (binMsgId && botState.binChannel) {
                   ensureMtprotoClient()
@@ -1953,36 +2106,9 @@ async function startTelegramPolling() {
                   'success',
                   `Saved to MongoDB & generated MTProto stream links for: ${rawFileName} (${vidId})`
                 );
-
-                // Only reply if message came from private chat or group (not BIN_CHANNEL post itself)
-                if (String(chatId) !== String(botState.binChannel)) {
-                  const safeHtmlFileName = displayTitle
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
-                  const replyRes = await fetch(`https://api.telegram.org/bot${botState.botToken}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      chat_id: chatId,
-                      reply_to_message_id: msg.message_id,
-                      text: buildBotReplyHtmlText(safeHtmlFileName, fileSize, watchEndpoint, dlEndpoint),
-                      parse_mode: 'HTML',
-                      disable_web_page_preview: true,
-                      reply_markup: buildMainQualityPromptKeyboard(vidId, watchEndpoint, dlEndpoint),
-                    }),
-                  });
-                  try {
-                    const replyData = (await replyRes.json()) as any;
-                    if (replyData.ok && replyData.result?.message_id) {
-                      newItem.botReplyMessageId = replyData.result.message_id;
-                      videos.set(vidId, newItem);
-                      await saveVideoToMongo(newItem);
-                    }
-                  } catch {
-                    // ignore
-                  }
-                }
+              }
+              } catch (updErr: any) {
+                addLog('warn', `Update handler notice: ${updErr?.message || updErr}`);
               }
             }
           }
@@ -2065,29 +2191,49 @@ async function startServer() {
       startTelegramPolling();
     } else {
       // Check if Render instance is already actively polling this bot so we don't cause 409 Conflict
-      try {
-        const renderHealthRes = await fetch(`${PERMANENT_RENDER_DOMAIN}/health`);
-        const renderHealth = (await renderHealthRes.json()) as any;
-        if (renderHealth?.ok && renderHealth?.botRunning) {
-          const meRes = await fetch(`https://api.telegram.org/bot${botState.botToken}/getMe`);
-          const meData = (await meRes.json()) as any;
-          if (meData?.ok) {
-            botState.isRunning = true;
-            botState.botUsername = meData.result.username;
-            botState.botFirstName = meData.result.first_name;
-            botState.lastError = null;
+      const checkRenderAndSyncPolling = async (isInitial = false) => {
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 5000);
+          const renderHealthRes = await fetch(`${PERMANENT_RENDER_DOMAIN}/health`, { signal: ctrl.signal });
+          clearTimeout(t);
+          const renderHealth = (await renderHealthRes.json()) as any;
+          if (renderHealth?.ok && renderHealth?.botRunning) {
+            if (pollingAbortController) {
+              pollingAbortController.abort();
+              pollingAbortController = null;
+              addLog('info', `Handed over Telegram getUpdates polling to active Render server (${PERMANENT_RENDER_DOMAIN})`);
+            }
+            if (isInitial || !botState.botUsername) {
+              const meRes = await fetch(`https://api.telegram.org/bot${botState.botToken}/getMe`);
+              const meData = (await meRes.json()) as any;
+              if (meData?.ok) {
+                botState.isRunning = true;
+                botState.botUsername = meData.result.username;
+                botState.botFirstName = meData.result.first_name;
+                botState.lastError = null;
+              }
+              ensureMtprotoClient();
+              if (isInitial) {
+                addLog(
+                  'success',
+                  `Render Bot (${PERMANENT_RENDER_DOMAIN}) is actively polling @${botState.botUsername || 'sr_video_quality_bot'}. Auto-Domain Rewriter active!`
+                );
+              }
+            }
+          } else if (!pollingAbortController) {
+            startTelegramPolling();
           }
-          ensureMtprotoClient();
-          addLog(
-            'success',
-            `Render Bot (${PERMANENT_RENDER_DOMAIN}) is actively polling @${botState.botUsername || 'sr_video_quality_bot'}. Auto-Domain Rewriter active!`
-          );
-        } else {
-          startTelegramPolling();
+        } catch {
+          if (!pollingAbortController) {
+            startTelegramPolling();
+          }
         }
-      } catch {
-        startTelegramPolling();
-      }
+      };
+      await checkRenderAndSyncPolling(true);
+      setInterval(() => {
+        checkRenderAndSyncPolling(false).catch(() => {});
+      }, 20_000);
     }
   }
 
@@ -2474,9 +2620,10 @@ async function startServer() {
   const getVideoBlockMap = (videoId: string): Map<number, Buffer> => {
     let map = videoBlockCache.get(videoId);
     if (!map) {
-      if (videoBlockCache.size >= 30) {
+      while (videoBlockCache.size >= 3) {
         const oldestKey = videoBlockCache.keys().next().value;
-        if (oldestKey) videoBlockCache.delete(oldestKey);
+        if (!oldestKey) break;
+        videoBlockCache.delete(oldestKey);
       }
       map = new Map<number, Buffer>();
       videoBlockCache.set(videoId, map);
@@ -2487,10 +2634,10 @@ async function startServer() {
   const storeVideoBlock = (videoId: string, blockIdx: number, buf: Buffer) => {
     if (!buf || buf.length === 0) return;
     const map = getVideoBlockMap(videoId);
-    if (!map.has(blockIdx) && map.size >= 36) {
-      // Keep block 0 (header) and block 1, evict oldest middle block
+    if (!map.has(blockIdx) && map.size >= 6) {
+      // Keep block 0 (header), evict oldest cached block to stay well within Render 512MB RAM limit
       for (const k of map.keys()) {
-        if (k !== 0 && k !== 1) {
+        if (k !== 0) {
           map.delete(k);
           break;
         }
@@ -2498,6 +2645,11 @@ async function startServer() {
     }
     map.set(blockIdx, buf);
     if (blockIdx === 0) {
+      while (firstChunkCache.size >= 6 && !firstChunkCache.has(videoId)) {
+        const oldestKey = firstChunkCache.keys().next().value;
+        if (!oldestKey) break;
+        firstChunkCache.delete(oldestKey);
+      }
       firstChunkCache.set(videoId, buf);
     }
   };
@@ -2843,7 +2995,7 @@ async function startServer() {
             }
           }
         }
-        prefetchAheadBlocks(item, startTailBlock, Math.min(8, lastBlockIdx - startTailBlock + 1));
+        prefetchAheadBlocks(item, startTailBlock, Math.min(3, lastBlockIdx - startTailBlock + 1));
       }
 
       return new Promise((resolve) => {
@@ -3095,6 +3247,8 @@ async function startServer() {
             `scale=-2:'min(${targetHeight},ih)'`,
             '-c:v',
             'libx264',
+            '-threads',
+            '2',
             '-preset',
             'ultrafast',
             '-tune',
@@ -3173,8 +3327,22 @@ async function startServer() {
 
     const fullDurationSec = Math.max(10, item.durationSec || 1420);
 
+    const activeFfmpegSet: Set<any> =
+      (globalThis as any).__srActiveFfmpegSet || ((globalThis as any).__srActiveFfmpegSet = new Set());
+
     const runFfmpegPipe = (useTranscode: boolean, allowFallback: boolean) => {
+      // Ensure Render 512MB container never accumulates multiple FFmpeg processes during rapid scrubbing
+      while (activeFfmpegSet.size >= 2) {
+        const oldestProc = activeFfmpegSet.values().next().value;
+        if (!oldestProc) break;
+        activeFfmpegSet.delete(oldestProc);
+        try {
+          oldestProc.kill('SIGKILL');
+        } catch {}
+      }
+
       const ff = spawn('ffmpeg', buildFfArgs(useTranscode), { stdio: ['ignore', 'pipe', 'ignore'] });
+      activeFfmpegSet.add(ff);
       let totalWritten = 0;
       let headersSent = false;
       let streamBuf = Buffer.alloc(0);
@@ -3182,6 +3350,7 @@ async function startServer() {
       const trackTimescales = new Map<number, number>();
 
       ff.on('error', () => {
+        activeFfmpegSet.delete(ff);
         if (!res.writableEnded) res.end();
       });
 
@@ -3315,6 +3484,7 @@ async function startServer() {
       });
 
       ff.on('close', () => {
+        activeFfmpegSet.delete(ff);
         if (streamBuf.length > 0) {
           flushChunk(streamBuf);
           streamBuf = Buffer.alloc(0);
@@ -3335,6 +3505,7 @@ async function startServer() {
       });
 
       req.on('close', () => {
+        activeFfmpegSet.delete(ff);
         try {
           ff.kill('SIGKILL');
         } catch {
@@ -3441,14 +3612,20 @@ async function startServer() {
       return;
     }
 
-    // 2. Telegram Video Streaming (MTProto for ALL sizes up to 2GB + Non-blocking Bot API cache for <=20MB)
+    // 2. Telegram Video Streaming (MTProto for ALL sizes up to 2GB + Low-RAM 512KB Block Cache)
     if (item.sourceType === 'telegram' && botState.botToken) {
-      // 2A: If file is <= 20MB and has telegramFileId, populate full-file RAM cache in background without blocking initial stream!
+      // Keep memory footprint strictly bounded for Render 512MB Free Tier (only cache tiny <=3MB clips in full buffer, max 2 files)
       if (
         item.telegramFileId &&
-        (!item.sizeBytes || item.sizeBytes <= 20 * 1024 * 1024) &&
+        item.sizeBytes &&
+        item.sizeBytes <= 3 * 1024 * 1024 &&
         !fileBufferCache.has(item.id)
       ) {
+        while (fileBufferCache.size >= 2) {
+          const oldKey = fileBufferCache.keys().next().value;
+          if (!oldKey) break;
+          fileBufferCache.delete(oldKey);
+        }
         void (async () => {
           try {
             const pathAge = Date.now() - (telegramFilePathFetchedAt.get(item.id) || 0);
@@ -3909,19 +4086,21 @@ async function startServer() {
       return;
     }
 
-    // Trigger 0ms background pre-warming without blocking HTML page load!
+    // Trigger 0ms background pre-warming and fast codec probe so initialIsNativeMp4 is 100% accurate
     warmUpVideoStream(item);
-    const initialProbe = videoProbeCache.get(item.id) || null;
-    const looksLikeMp4 =
-      (item.mimeType && item.mimeType.toLowerCase().includes('mp4')) ||
-      (item.fileName && item.fileName.toLowerCase().endsWith('.mp4'));
+    const initialProbe =
+      videoProbeCache.get(item.id) ||
+      (await Promise.race([
+        probeVideoCodec(item),
+        new Promise<VideoProbeInfo | null>((r) => setTimeout(() => r(null), 900)),
+      ]));
 
     const relativeStreamUrl = `/stream/${item.id}`;
     const relativeRemuxUrl = `/remux/${item.id}`;
     const relativeDlUrl = `/dl/${item.id}`;
     const relativeMetaUrl = `/api/video-meta/${encodeURIComponent(item.id)}`;
     const initialDurationSec = item?.durationSec || 1420;
-    const initialIsNativeMp4 = initialProbe ? Boolean(initialProbe.isNativeMp4) : Boolean(looksLikeMp4);
+    const initialIsNativeMp4 = initialProbe ? Boolean(initialProbe.isNativeMp4) : false;
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(`<!DOCTYPE html>
@@ -4217,6 +4396,8 @@ async function startServer() {
     let isNativeMp4 = ${initialIsNativeMp4 ? 'true' : 'false'};
     let seekOffsetSec = 0;
     let pendingJumpSec = 0;
+    let needJumpToSec = null;
+    let desiredSeekSec = null;
     let isProgrammaticSeek = false;
     let lastKnownTime = 0;
     let seekDebounceTimer = null;
@@ -4288,8 +4469,14 @@ async function startServer() {
           if (mseAbortCtrl) {
             try { mseAbortCtrl.abort(); } catch (e3) {}
           }
+          const fallbackTarget = Math.floor(
+            (needJumpToSec !== null ? needJumpToSec : desiredSeekSec) || lastKnownTime || seekOffsetSec || 0
+          );
           mseActive = false;
-          v.src = buildVideoSrc(activeQuality, fallbackStage, Math.floor(lastKnownTime || seekOffsetSec || 0));
+          needJumpToSec = null;
+          seekOffsetSec = fallbackTarget;
+          pendingJumpSec = fallbackTarget;
+          v.src = buildVideoSrc(activeQuality, fallbackStage, fallbackTarget);
           v.load();
           v.play().catch(() => {});
         }
@@ -4306,7 +4493,13 @@ async function startServer() {
       const clampedSec = Math.max(0, Math.floor(Number(targetSec) || 0));
       seekOffsetSec = clampedSec;
       lastKnownTime = clampedSec;
+      needJumpToSec = clampedSec > 0 ? clampedSec : null;
       if (sourceBuffer) {
+        try {
+          if (sourceBuffer.updating) {
+            sourceBuffer.abort();
+          }
+        } catch (e) {}
         pendingTimestampOffset = clampedSec;
       }
 
@@ -4366,14 +4559,36 @@ async function startServer() {
                         }
                       }
                       if (sourceBuffer && sourceBuffer.buffered && sourceBuffer.buffered.length > 0) {
-                        for (let i = 0; i < sourceBuffer.buffered.length; i++) {
-                          const bStart = sourceBuffer.buffered.start(i);
-                          const bEnd = sourceBuffer.buffered.end(i);
-                          if (Math.abs(v.currentTime - bStart) < 2.5 && v.currentTime < bStart && bEnd > bStart + 0.05) {
-                            isProgrammaticSeek = true;
-                            v.currentTime = bStart + 0.02;
-                            setTimeout(() => { isProgrammaticSeek = false; }, 150);
-                            break;
+                        if (needJumpToSec !== null) {
+                          for (let i = 0; i < sourceBuffer.buffered.length; i++) {
+                            const bStart = sourceBuffer.buffered.start(i);
+                            const bEnd = sourceBuffer.buffered.end(i);
+                            if (
+                              bStart <= needJumpToSec + 12 &&
+                              bEnd >= needJumpToSec + 0.15 &&
+                              bEnd > bStart + 0.15
+                            ) {
+                              const jumpTarget = Math.min(bEnd - 0.02, Math.max(needJumpToSec, bStart + 0.02));
+                              needJumpToSec = null;
+                              desiredSeekSec = null;
+                              isProgrammaticSeek = true;
+                              v.currentTime = jumpTarget;
+                              lastKnownTime = jumpTarget;
+                              v.play().catch(() => {});
+                              setTimeout(() => { isProgrammaticSeek = false; }, 250);
+                              break;
+                            }
+                          }
+                        } else {
+                          for (let i = 0; i < sourceBuffer.buffered.length; i++) {
+                            const bStart = sourceBuffer.buffered.start(i);
+                            const bEnd = sourceBuffer.buffered.end(i);
+                            if (Math.abs(v.currentTime - bStart) < 2.5 && v.currentTime < bStart && bEnd > bStart + 0.05) {
+                              isProgrammaticSeek = true;
+                              v.currentTime = bStart + 0.02;
+                              setTimeout(() => { isProgrammaticSeek = false; }, 150);
+                              break;
+                            }
                           }
                         }
                       }
@@ -4462,13 +4677,14 @@ async function startServer() {
         .catch(() => {});
     }
 
-    function startMsePlayback(quality, startSec, preferDirectMp4) {
+    function startMsePlayback(quality, startSec) {
       const clamped = Math.max(0, Math.floor(Number(startSec) || 0));
-      if ((preferDirectMp4 && isNativeMp4 && fallbackStage <= 1 && clamped === 0) || !canUseMse) {
+      if (!canUseMse) {
         if (mseAbortCtrl) {
           try { mseAbortCtrl.abort(); } catch (e) {}
         }
         mseActive = false;
+        needJumpToSec = null;
         seekOffsetSec = clamped;
         pendingJumpSec = clamped;
         lastKnownTime = clamped;
@@ -4482,13 +4698,13 @@ async function startServer() {
       }
 
       if (mseActive && mse && mse.readyState === 'open' && sourceBuffer) {
-        if (clamped > 0 && Math.abs((v.currentTime || 0) - clamped) > 1) {
+        needJumpToSec = clamped > 0 ? clamped : null;
+        if (clamped > 0 && Math.abs((v.currentTime || 0) - clamped) > 0.5) {
           isProgrammaticSeek = true;
-          v.currentTime = clamped;
-          setTimeout(() => { isProgrammaticSeek = false; }, 200);
+          try { v.currentTime = clamped; } catch (e) {}
+          setTimeout(() => { isProgrammaticSeek = false; }, 250);
         }
         fetchMseStream(quality, clamped, fallbackStage >= 3);
-        v.play().catch(() => {});
         return;
       }
 
@@ -4498,6 +4714,7 @@ async function startServer() {
       sourceBuffer = null;
       mseQueue = [];
       pendingTimestampOffset = null;
+      needJumpToSec = clamped > 0 ? clamped : null;
       mse = new MediaSource();
       mseActive = true;
       isProgrammaticSeek = true;
@@ -4505,10 +4722,6 @@ async function startServer() {
       mse.addEventListener(
         'sourceopen',
         () => {
-          if (clamped > 0) {
-            isProgrammaticSeek = true;
-            v.currentTime = clamped;
-          }
           setTimeout(() => { isProgrammaticSeek = false; }, 250);
           fetchMseStream(quality, clamped, fallbackStage >= 3);
         },
@@ -4658,32 +4871,40 @@ async function startServer() {
       if (isProgrammaticSeek || pendingJumpSec > 0) return;
       const target = Number(v.currentTime) || 0;
 
-      // 1. If already buffered in current stream, let browser seek in 0ms
+      // 1. If already buffered in current stream AND no unbuffered seek is currently pending, let browser seek in 0ms
       if (isTimeBuffered(target)) {
-        lastKnownTime = target;
+        if (desiredSeekSec === null && needJumpToSec === null) {
+          lastKnownTime = target;
+        }
         return;
       }
 
-      // 2. If native MP4 at offset 0 and browser supports HTTP 206 byte range seek
+      // 2. If native MP4 at offset 0 (non-MSE) and browser supports HTTP 206 byte range seek
       if (canBrowserByteSeek(target)) {
         lastKnownTime = target;
         return;
       }
 
-      // 3. Otherwise use instant server-side FFmpeg seek (?ss=) via MSE SourceBuffer
+      // 3. Capture exact unbuffered target timestamp BEFORE mobile browser can snap v.currentTime back to 0!
+      desiredSeekSec = target;
+      needJumpToSec = target;
       lastKnownTime = target;
       if (seekDebounceTimer) clearTimeout(seekDebounceTimer);
       seekDebounceTimer = setTimeout(() => {
-        const finalTarget = Number(v.currentTime) || target;
+        seekDebounceTimer = null;
+        const finalTarget = desiredSeekSec !== null ? desiredSeekSec : target;
         if (!isTimeBuffered(finalTarget)) {
           seekViaServer(finalTarget);
+        } else {
+          desiredSeekSec = null;
+          needJumpToSec = null;
         }
-      }, 140);
+      }, 90);
     });
 
     v.addEventListener('timeupdate', () => {
       tryApplyPendingJump();
-      if (!v.seeking && !isProgrammaticSeek && pendingJumpSec === 0) {
+      if (!v.seeking && !isProgrammaticSeek && pendingJumpSec === 0 && needJumpToSec === null && desiredSeekSec === null) {
         const cur = v.currentTime >= seekOffsetSec - 2 ? v.currentTime : seekOffsetSec + v.currentTime;
         if (cur > 0) {
           lastKnownTime = cur;
@@ -4706,7 +4927,12 @@ async function startServer() {
       }
       if (mseActive) {
         mseActive = false;
-        const resumeAt = Math.floor(lastKnownTime || seekOffsetSec || 0);
+        const resumeAt = Math.floor(
+          (needJumpToSec !== null ? needJumpToSec : desiredSeekSec) || lastKnownTime || seekOffsetSec || 0
+        );
+        needJumpToSec = null;
+        seekOffsetSec = resumeAt;
+        pendingJumpSec = resumeAt;
         fallbackStage = Math.max(fallbackStage, 2);
         v.src = buildVideoSrc(activeQuality, fallbackStage, resumeAt);
         v.load();
@@ -4715,6 +4941,8 @@ async function startServer() {
       }
       if (fallbackStage < 3) {
         const resumeAt = Math.floor(lastKnownTime || seekOffsetSec || 0);
+        seekOffsetSec = resumeAt;
+        pendingJumpSec = resumeAt;
         fallbackStage += 1;
         v.src = buildVideoSrc(activeQuality, fallbackStage, resumeAt);
         v.load();
@@ -4723,7 +4951,7 @@ async function startServer() {
     });
 
     if (${hasExplicitQuality ? 'true' : 'false'}) {
-      startMsePlayback(activeQuality, 0, true);
+      startMsePlayback(activeQuality, 0);
     }
 
     function openQualityModal() {
@@ -4740,7 +4968,7 @@ async function startServer() {
       });
       qualityModal.classList.add('hidden');
       fallbackStage = 0;
-      startMsePlayback(q, savedTime > 2 ? savedTime : 0, savedTime <= 2);
+      startMsePlayback(q, savedTime > 2 ? savedTime : 0);
       wakeQualityPill();
     }
 
@@ -4889,13 +5117,13 @@ async function startServer() {
   app.get('/player/:id', handleStandalonePlayer);
   app.get('/watch/:id', handleStandalonePlayer);
 
-  // Pre-warm top 3 videos in background on startup for instant playback
+  // Pre-warm only the single latest video lazily so startup RAM stays ultra-low on Render 512MB free tier
   setTimeout(() => {
-    const topVids = Array.from(videos.values()).slice(0, 3);
-    for (const v of topVids) {
-      warmUpVideoStream(v);
+    const topVid = Array.from(videos.values())[0];
+    if (topVid) {
+      warmUpVideoStream(topVid);
     }
-  }, 1500);
+  }, 3000);
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
