@@ -14,9 +14,9 @@ export function generateFixedPythonFiles(params: PythonTemplateParams) {
   const mongoUri =
     params.mongoUri ||
     '';
-  const apiId = params.apiId || '2040';
-  const apiHash = params.apiHash || 'b18441a1ff607e10a989891a5462e627';
-  const botToken = params.botToken || 'YOUR_BOT_TOKEN_HERE';
+  const apiId = params.apiId || '29608422';
+  const apiHash = params.apiHash || '3db2f8e109301f02f5d9c8f10dd79244';
+  const botToken = params.botToken || '8765885559:AAE3c2g_21nwFF7Ens8IXloOkNW3WJ_9Yhk';
   const binChannel = params.binChannel || '-1001982736450';
 
   const mainPy = `import os
@@ -42,7 +42,7 @@ logger = logging.getLogger("SR-VIDEO-QUALITY")
 # 100% WORKING CONFIGURATION (MongoDB Atlas + Domain + Telegram MTProto)
 # ==============================================================================
 MONGO_URI = os.environ.get(
-    "MONGO_URI",
+    "mongodb+srv://sabbirvai1122:SABBIRVAI1122@cluster0.t1bsiei.mongodb.net/?appName=Cluster0",
     "${mongoUri}"
 )
 API_ID = int(os.environ.get("API_ID", "${apiId}"))
