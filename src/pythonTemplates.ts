@@ -9,11 +9,11 @@ export interface PythonTemplateParams {
 
 export function generateFixedPythonFiles(params: PythonTemplateParams) {
   const cleanDomain = (
-    params.domain || ''
+    params.domain || 'https://sevideotolink.netlify.app/'
   ).replace(/\/$/, '');
   const mongoUri =
     params.mongoUri ||
-    '';
+    'mongodb+srv://sabbirvai1122:SABBIRVAI1122@cluster0.t1bsiei.mongodb.net/?appName=Cluster0';
   const apiId = params.apiId || '29608422';
   const apiHash = params.apiHash || '3db2f8e109301f02f5d9c8f10dd79244';
   const botToken = params.botToken || '8765885559:AAE3c2g_21nwFF7Ens8IXloOkNW3WJ_9Yhk';
@@ -42,7 +42,7 @@ logger = logging.getLogger("SR-VIDEO-QUALITY")
 # 100% WORKING CONFIGURATION (MongoDB Atlas + Domain + Telegram MTProto)
 # ==============================================================================
 MONGO_URI = os.environ.get(
-    "mongodb+srv://sabbirvai1122:SABBIRVAI1122@cluster0.t1bsiei.mongodb.net/?appName=Cluster0",
+    "MONGODB URI",
     "${mongoUri}"
 )
 API_ID = int(os.environ.get("API_ID", "${apiId}"))
