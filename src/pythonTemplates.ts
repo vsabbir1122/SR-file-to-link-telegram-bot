@@ -9,14 +9,14 @@ export interface PythonTemplateParams {
 
 export function generateFixedPythonFiles(params: PythonTemplateParams) {
   const cleanDomain = (
-    params.domain || 'https://sevideotolink.netlify.app/'
+    params.domain || ''
   ).replace(/\/$/, '');
   const mongoUri =
     params.mongoUri ||
-    'mongodb+srv://sabbirvai1122:SABBIRVAI1122@cluster0.t1bsiei.mongodb.net/?appName=Cluster0';
+    '';
   const apiId = params.apiId || '29608422';
   const apiHash = params.apiHash || '3db2f8e109301f02f5d9c8f10dd79244';
-  const botToken = params.botToken || '8765885559:AAE3c2g_21nwFF7Ens8IXloOkNW3WJ_9Yhk';
+  const botToken = params.botToken || '';
   const binChannel = params.binChannel || '-1001982736450';
 
   const mainPy = `import os
